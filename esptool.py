@@ -199,24 +199,24 @@ class ESPLoader(object):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((ESPLoader.RTT_HOST, ESPLoader.RTT_PORT))
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+
             f = s.makefile('rwb')
             if isinstance(port, basestring):
                 self._port = f #serial.serial_for_url(port)
                 self._sock = s
             else:
                 self._port = port
-            self._slip_reader = slip_reader(self._port, self.trace, rtt=True)
         else:
             if isinstance(port, basestring):
                 self._port = serial.serial_for_url(port)
             else:
                 self._port = port
-            self._slip_reader = slip_reader(self._port, self.trace)
             # setting baud rate in a separate step is a workaround for
             # CH341 driver on some Linux versions (this opens at 9600 then
             # sets), shouldn't matter for other platforms/drivers. See
             # https://github.com/espressif/esptool/issues/44#issuecomment-107094446
             self._set_port_baudrate(baud)
+        self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT)
         self._trace_enabled = trace_enabled
 
     def _set_port_baudrate(self, baud):
@@ -997,6 +997,9 @@ class ESP8266StubLoader(ESP8266ROM):
     IS_STUB = True
 
     def __init__(self, rom_loader):
+        self.USE_RTT = rom_loader.USE_RTT
+        if self.USE_RTT:
+            self._sock = rom_loader._sock
         self._port = rom_loader._port
         self._trace_enabled = rom_loader._trace_enabled
         self.flush_input()  # resets _slip_reader
@@ -1689,7 +1692,6 @@ def slip_reader(port, trace_function, rtt=False):
         if rtt:
             port.flush()
             read_bytes = port.read(1)
-            port.flush()
         else:
             waiting = port.inWaiting()
             read_bytes = port.read(1 if waiting == 0 else waiting)
@@ -1710,6 +1712,7 @@ def slip_reader(port, trace_function, rtt=False):
                     if rtt is False:
                         trace_function("Remaining data in serial buffer: %r", port.read(port.inWaiting()))
                     #raise FatalError('Invalid head of packet (%r)' % b)
+                    print('Invalid head of packet (%r)' % b)
             elif in_escape:  # part-way through escape sequence
                 in_escape = False
                 if b == b'\xdc':
@@ -1720,6 +1723,7 @@ def slip_reader(port, trace_function, rtt=False):
                     trace_function("Read invalid data: %r", read_bytes)
                     trace_function("Remaining data in serial buffer: %r", port.read(port.inWaiting()))
                     #raise FatalError('Invalid SLIP escape (%r%r)' % (b'\xdb', b))
+                    print('Invalid SLIP escape (%r%r)' % (b'\xdb', b))
             elif b == b'\xdb':  # start of escape sequence
                 in_escape = True
             elif b == b'\xc0':  # end of packet
