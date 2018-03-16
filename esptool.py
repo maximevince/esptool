@@ -195,15 +195,22 @@ class ESPLoader(object):
         """
         if (rtt is True):
             self.USE_RTT = True
-            print("RTT mode selected")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((ESPLoader.RTT_HOST, ESPLoader.RTT_PORT))
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            print("Connected to RTT socket!")
 
-            f = s.makefile('rwb')
+            # Read pending bytes from socket (JLink welcome screen etc ...)
+            s.settimeout(0.3)
+            try:
+                bytes = s.recv(1)
+                while bytes:
+                    bytes = s.recv(1)
+            except socket.timeout:
+                print("Socket flushed")
+
             if isinstance(port, basestring):
-                self._port = f #serial.serial_for_url(port)
-                self._sock = s
+                self._port = s
             else:
                 self._port = port
         else:
@@ -262,9 +269,11 @@ class ESPLoader(object):
               + (packet.replace(b'\xdb',b'\xdb\xdd').replace(b'\xc0',b'\xdb\xdc')) \
               + b'\xc0'
         self.trace("Write %d bytes: %r", len(buf), buf)
-        self._port.write(buf)
         if self.USE_RTT:
-            self._port.flush()
+            self._port.send(buf)
+            #self._port.flush()
+        else:
+            self._port.write(buf)
 
     def trace(self, message, *format_args):
         if self._trace_enabled:
@@ -291,16 +300,11 @@ class ESPLoader(object):
 
     """ Send a request and read the response """
     def command(self, op=None, data=b"", chk=0, wait_response=True, timeout=DEFAULT_TIMEOUT):
-        if self.USE_RTT:
-            saved_timeout = self._sock.timeout
-        else:
-            saved_timeout = self._port.timeout
+        saved_timeout = self._port.timeout
         new_timeout = min(timeout, MAX_TIMEOUT)
         if new_timeout != saved_timeout:
             if self.USE_RTT is True:
-                #self._port.settimeout(new_timeout)
-                self._sock.settimeout(new_timeout*10.0)
-                #print("Setting timeout: " + str(new_timeout))
+                self._port.settimeout(new_timeout)
             else:
                 self._port.timeout = new_timeout
 
@@ -331,8 +335,7 @@ class ESPLoader(object):
         finally:
             if new_timeout != saved_timeout:
                 if self.USE_RTT is True:
-                    #self._port.settimeout(saved_timeout)
-                    self._sock.settimeout(saved_timeout)
+                    self._port.settimeout(saved_timeout)
                 else:
                     self._port.timeout = saved_timeout
 
@@ -365,10 +368,10 @@ class ESPLoader(object):
             return val
 
     def flush_input(self):
-        if self.USE_RTT:
-            self._port.flush()
-        else:
+        if self.USE_RTT is False:
             self._port.flushInput()
+        #else:
+            #self._port.flush()
         self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT)
 
     def sync(self):
@@ -998,8 +1001,6 @@ class ESP8266StubLoader(ESP8266ROM):
 
     def __init__(self, rom_loader):
         self.USE_RTT = rom_loader.USE_RTT
-        if self.USE_RTT:
-            self._sock = rom_loader._sock
         self._port = rom_loader._port
         self._trace_enabled = rom_loader._trace_enabled
         self.flush_input()  # resets _slip_reader
@@ -1688,10 +1689,13 @@ def slip_reader(port, trace_function, rtt=False):
     """
     partial_packet = None
     in_escape = False
+    read_bytes = b''
     while True:
         if rtt:
-            port.flush()
-            read_bytes = port.read(1)
+            try:
+                read_bytes = port.recv(1)
+            except socket.timeout:
+                print("Socket timeout")
         else:
             waiting = port.inWaiting()
             read_bytes = port.read(1 if waiting == 0 else waiting)
