@@ -31,8 +31,10 @@ import struct
 import sys
 import time
 import zlib
-
+import errno
 import serial
+
+from binascii import hexlify
 
 __version__ = "2.3.2-dev"
 
@@ -128,6 +130,7 @@ class ESPLoader(object):
     USE_RTT = False
     RTT_PORT = 19021
     RTT_HOST = "127.0.0.1"
+    rtt_timeout = 3
 
     # Commands supported by ESP8266 ROM bootloader
     ESP_FLASH_BEGIN = 0x02
@@ -198,10 +201,11 @@ class ESPLoader(object):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((ESPLoader.RTT_HOST, ESPLoader.RTT_PORT))
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print("Connected to RTT socket!")
 
             # Read pending bytes from socket (JLink welcome screen etc ...)
-            s.settimeout(0.3)
+            s.settimeout(0.1)
             try:
                 bytes = s.recv(1)
                 while bytes:
@@ -268,9 +272,10 @@ class ESPLoader(object):
         buf = b'\xc0' \
               + (packet.replace(b'\xdb',b'\xdb\xdd').replace(b'\xc0',b'\xdb\xdc')) \
               + b'\xc0'
-        self.trace("Write %d bytes: %r", len(buf), buf)
+        self.trace("Write %d bytes: 0x%r", len(buf), hexlify(buf))
         if self.USE_RTT:
             self._port.send(buf)
+            self.trace("Writing done!")
             #self._port.flush()
         else:
             self._port.write(buf)
@@ -284,7 +289,7 @@ class ESPLoader(object):
             except AttributeError:
                 delta = 0.0
             self._last_trace = now
-            prefix = "TRACE +%.3f " % delta
+            prefix = "TRACE %f +%.3f " % (now, delta)
             print(prefix + (message % format_args))
 
     """ Calculate checksum of a blob, as it is defined by the ROM """
@@ -304,14 +309,16 @@ class ESPLoader(object):
         new_timeout = min(timeout, MAX_TIMEOUT)
         if new_timeout != saved_timeout:
             if self.USE_RTT is True:
-                self._port.settimeout(new_timeout)
+                #self.trace("settimeout: %d", new_timeout)
+                #self._port.settimeout(new_timeout)
+                self.rtt_timeout = new_timeout
             else:
                 self._port.timeout = new_timeout
 
         try:
             if op is not None:
-                self.trace("command op=0x%02x data len=%s wait_response=%d timeout=%.3f data=%r",
-                           op, len(data), 1 if wait_response else 0, timeout, data)
+                self.trace("command op=0x%02x data len=%s wait_response=%d timeout=%.3f data=0x%r",
+                           op, len(data), 1 if wait_response else 0, timeout, hexlify(data))
                 pkt = struct.pack(b'<BBHI', 0x00, op, len(data), chk) + data
                 self.write(pkt)
 
@@ -322,11 +329,12 @@ class ESPLoader(object):
             # same operation as the request or a retries limit has
             # exceeded. This is needed for some esp8266s that
             # reply with more sync responses than expected.
-            for retry in range(100):
+            for retry in range(1000):
                 p = self.read()
                 if len(p) < 8:
                     continue
                 (resp, op_ret, len_ret, val) = struct.unpack('<BBHI', p[:8])
+                self.trace("RXed packet: resp: %r op_ret: %r, len_ret: %r, val: %r", resp, op_ret, len_ret, val)
                 if resp != 1:
                     continue
                 data = p[8:]
@@ -335,7 +343,7 @@ class ESPLoader(object):
         finally:
             if new_timeout != saved_timeout:
                 if self.USE_RTT is True:
-                    self._port.settimeout(saved_timeout)
+                    self.rtt_timeout = saved_timeout
                 else:
                     self._port.timeout = saved_timeout
 
@@ -372,7 +380,7 @@ class ESPLoader(object):
             self._port.flushInput()
         #else:
             #self._port.flush()
-        self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT)
+        self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT, rtt_timeout=10)
 
     def sync(self):
         self.command(self.ESP_SYNC, b'\x07\x07\x12\x20' + 32 * b'\x55',
@@ -1680,7 +1688,7 @@ class ELFFile(object):
         self.sections = prog_sections
 
 
-def slip_reader(port, trace_function, rtt=False):
+def slip_reader(port, trace_function, rtt=False, rtt_timeout=1):
     """Generator to read SLIP packets from a serial port.
     Yields one full SLIP packet at a time, raises exception on timeout or invalid data.
 
@@ -1689,21 +1697,49 @@ def slip_reader(port, trace_function, rtt=False):
     """
     partial_packet = None
     in_escape = False
+    starttime = time.time()
     read_bytes = b''
+    if rtt:
+        port.settimeout(0.0) # non-blocking mode
     while True:
         if rtt:
-            try:
-                read_bytes = port.recv(1)
-            except socket.timeout:
-                print("Socket timeout")
+            # check timeout
+            if time.time() > starttime + rtt_timeout:
+                print("Socket read timeout")
+                read_bytes = b'' # handled later
+            else:
+                try:
+                    read_bytes = b''
+                    read_bytes = port.recv(4)
+                    trace_function("RTT Read %d bytes: 0x%r", len(read_bytes), hexlify(read_bytes))
+                    if len(read_bytes) > 0:
+                        starttime = time.time() # reset read timeout after successful read
+                except socket.timeout:
+                    print("Socket timeout") # happens in blocking mode
+                except socket.error as e:
+                    if e.args[0] == errno.EWOULDBLOCK:
+                        # we read all bytes available
+                        length =  len(read_bytes)
+                        if length == 0:
+                            continue # we need to try reading again
+                        else:
+                            print("ewouldblock - read {} bytes".format(len(read_bytes)))
+                    else:
+                        print(e)
+                        print("RTT EXCEPTION")
+                        break
         else:
             waiting = port.inWaiting()
             read_bytes = port.read(1 if waiting == 0 else waiting)
+
+
+        # timeout condition?
         if read_bytes == b'':
             waiting_for = "header" if partial_packet is None else "content"
             trace_function("Timed out waiting for packet %s", waiting_for)
             raise FatalError("Timed out waiting for packet %s" % waiting_for)
-        trace_function("Read %d bytes: %r", len(read_bytes), read_bytes)
+
+        #trace_function("Read %d bytes: 0x%r", len(read_bytes), hexlify(read_bytes))
         for b in read_bytes:
             if type(b) is int:
                 b = bytes([b])  # python 2/3 compat
@@ -1712,11 +1748,11 @@ def slip_reader(port, trace_function, rtt=False):
                 if b == b'\xc0':
                     partial_packet = b""
                 else:
-                    trace_function("Read invalid data: %r", read_bytes)
+                    trace_function("Read invalid byte: %r (%r)", b, hexlify(b))
                     if rtt is False:
                         trace_function("Remaining data in serial buffer: %r", port.read(port.inWaiting()))
                     #raise FatalError('Invalid head of packet (%r)' % b)
-                    print('Invalid head of packet (%r)' % b)
+                    print('Invalid head of packet (0x%r)' % hexlify(b))
             elif in_escape:  # part-way through escape sequence
                 in_escape = False
                 if b == b'\xdc':
@@ -1724,14 +1760,15 @@ def slip_reader(port, trace_function, rtt=False):
                 elif b == b'\xdd':
                     partial_packet += b'\xdb'
                 else:
-                    trace_function("Read invalid data: %r", read_bytes)
-                    trace_function("Remaining data in serial buffer: %r", port.read(port.inWaiting()))
+                    trace_function("Read invalid data: 0x%r", hexlify(read_bytes))
+                    if rtt is False:
+                        trace_function("Remaining data in serial buffer: %r", port.read(port.in_waiting()))
                     #raise FatalError('Invalid SLIP escape (%r%r)' % (b'\xdb', b))
                     print('Invalid SLIP escape (%r%r)' % (b'\xdb', b))
             elif b == b'\xdb':  # start of escape sequence
                 in_escape = True
             elif b == b'\xc0':  # end of packet
-                trace_function("Full packet: %r", partial_packet)
+                trace_function("END-OF-PACKET -> Full packet: 0x%r", hexlify(partial_packet))
                 yield partial_packet
                 partial_packet = None
             else:  # normal byte in packet
