@@ -309,8 +309,7 @@ class ESPLoader(object):
         new_timeout = min(timeout, MAX_TIMEOUT)
         if new_timeout != saved_timeout:
             if self.USE_RTT is True:
-                #self.trace("settimeout: %d", new_timeout)
-                #self._port.settimeout(new_timeout)
+                self.trace("settimeout: %d", new_timeout)
                 self.rtt_timeout = new_timeout
             else:
                 self._port.timeout = new_timeout
@@ -380,7 +379,7 @@ class ESPLoader(object):
             self._port.flushInput()
         #else:
             #self._port.flush()
-        self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT, rtt_timeout=10)
+        self._slip_reader = slip_reader(self._port, self.trace, rtt=self.USE_RTT, rtt_timeout=self.rtt_timeout)
 
     def sync(self):
         self.command(self.ESP_SYNC, b'\x07\x07\x12\x20' + 32 * b'\x55',
